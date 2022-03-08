@@ -6,7 +6,7 @@ use rust_decimal::Decimal;
 mod tests {
     use rust_decimal::Decimal;
 
-    use crate::{AssetPool, Asset};
+    use crate::{AssetPool, Asset, MutatorPool, AccountPool, MutatorBase};
 
     #[test]
     fn asset_pool_changes() {
@@ -47,6 +47,39 @@ mod tests {
 
         
     }
+
+    // struct MockModel {
+    //     assets: Vec<Decimal>,
+    //     partial_mutators: Vec<(Decimal, u64, u64)>,
+    // }
+
+    // impl MockModel {
+
+    //     /// Assets: 0, 1,000, 50,000, -8,000
+    //     /// Mutators: (0, 100, 3, )
+    //     pub fn init() -> MockModel {
+    //         MockModel {
+    //             assets: vec![
+    //                 Decimal::ZERO,
+    //                 Decimal::new(1000, 0),
+    //                 Decimal::new(50000, 0)
+    //             ],
+    //             partial_mutators: vec![
+    //                 (Decimal::new(100, 0), 3, 48),
+    //                 (Decimal::new(2, ))
+    //             ]
+    //         }
+    //     }
+    // }
+
+    // #[test]
+    // fn projection() {
+    //     let asset_pool = AssetPool::new();
+    //     let mutator_pool = MutatorPool::new();
+    //     let account_pool = AccountPool::new();
+
+        
+    // }
 }
 
 #[derive(PartialEq, Eq)]
@@ -108,13 +141,12 @@ impl Account {
 }
 
 pub struct AccountPool {
-    accounts: RefCell<Vec<Account>>,
-    asset_pool: Rc<AssetPool>
+    accounts: RefCell<Vec<Account>>
 }
 
 impl AccountPool {
-    pub fn new(asset_pool: Rc<AssetPool>) -> Rc<AccountPool> {
-        Rc::new(AccountPool { accounts: RefCell::new(vec![]), asset_pool })
+    pub fn new() -> Rc<AccountPool> {
+        Rc::new(AccountPool { accounts: RefCell::new(vec![]) })
     }
 
     pub fn load_account(&self) -> usize {
@@ -139,20 +171,20 @@ impl AccountPool {
     /// Get total value of the account at idx.
     /// 
     /// Returns None if no element is found at idx.
-    pub fn get(&self, idx: usize) -> Option<Decimal> {
+    pub fn get(&self, idx: usize, asset_pool: Rc<AssetPool>) -> Option<Decimal> {
         if let Some(account) = self.accounts.borrow().get(idx) {
-            Some(account.total_value(Rc::clone(&self.asset_pool)))
+            Some(account.total_value(Rc::clone(&asset_pool)))
         } else { None }
     }
 
     /// Get total value of the account at idx.
     /// 
     /// No out of bounds checking, which may result in undefined behavior if no element is found at idx.
-    pub unsafe fn get_unchecked(&self, idx: usize) -> Decimal {
+    pub unsafe fn get_unchecked(&self, idx: usize, asset_pool: Rc<AssetPool>) -> Decimal {
         self.accounts
             .borrow()
             .get_unchecked(idx)
-            .total_value(Rc::clone(&self.asset_pool))
+            .total_value(Rc::clone(&asset_pool))
     }
 
     /// Removes and returns the accounts from the given `AccountPool`.
@@ -296,20 +328,19 @@ pub struct MutatorBase {
     pub target_idx: usize,
     pub change: Decimal,
     pub total_change: Decimal,
-    pub is_add: bool,
-    pub cycle: u32,
+    pub cycle: u64,
     cycle_reciprocal: f64,
     pub unix_reference: u64
 }
 
 impl MutatorBase {
     pub fn new(idx: usize, target_idx: usize, change: Decimal, 
-        total_change: Decimal, is_add: bool, cycle: u32, unix_reference: u64) 
+        total_change: Decimal, cycle: u64, unix_reference: u64) 
             -> MutatorBase 
     {
         let cycle_reciprocal = (1 as f64) / (cycle as f64);
         
-        MutatorBase { idx, target_idx, change, total_change, is_add, cycle, cycle_reciprocal, unix_reference }
+        MutatorBase { idx, target_idx, change, total_change, cycle, cycle_reciprocal, unix_reference }
     }
 
     pub fn capture(&self) -> MutatorBaseCapture {
@@ -322,26 +353,25 @@ impl MutatorBase {
 
     pub fn projection_length(&self, unix_initial_event: u64) -> u64 {
         // TODO: There's no way this is the best way to handle it.
-        ((unix_initial_event - (unix_initial_event % self.cycle as u64)) as f64 * self.cycle_reciprocal) as u64 + 1
+        ((unix_initial_event - (unix_initial_event % self.cycle)) as f64 * self.cycle_reciprocal) as u64 + 1
     }
 
     pub fn unix_initial_event(&self, start: u64) -> u64 {
-        let cycle64 = self.cycle as u64;
         let mut ur_cpy = self.unix_reference;
-        let top = start + cycle64;
-        let bottom = start - cycle64;
+        let top = start + self.cycle;
+        let bottom = start - self.cycle;
 
         if self.unix_reference != start {
-            while cycle64 > top || cycle64 < bottom {
-                ur_cpy += cycle64;
+            while self.cycle > top || self.cycle < bottom {
+                ur_cpy += self.cycle;
             }
         };
 
-        if ur_cpy >= start {
-            return ur_cpy;
+        if ur_cpy < start {
+            ur_cpy += self.cycle;
         }
 
-        ur_cpy + cycle64
+        ur_cpy
     }
 }
 
@@ -350,6 +380,7 @@ pub trait Mutator {
     fn capture(&self) -> MutatorCapture;
     fn reset(&mut self, capture: MutatorCapture);
     fn borrow_base(&self) -> &MutatorBase;
+    fn create_events(&self, start: u64, end: u64, idx: usize) -> Vec<Event>;
 }
 
 pub struct MutatorCapture {
@@ -376,6 +407,28 @@ impl Mutator for StandardMutator {
     fn reset(&mut self, capture: MutatorCapture) {
         self.0.reset(capture.base)
     }
+
+    fn create_events(&self, start: u64, end: u64, idx: usize) -> Vec<Event> {
+        let mut out = Vec::new();
+
+        if self.0.cycle > end - start || self.0.cycle == 0 {
+            return out;
+        }
+
+        let uie = self.0.unix_initial_event(start);
+        let rie = uie - start;
+        let pl = self.0.projection_length(uie);
+
+        for i in 0..pl {
+            out.push(Event {
+                time_pos:       rie + (self.0.cycle * i), 
+                mutator_idx:    idx,
+                asset_idx:      self.0.target_idx
+            });
+        }
+
+        out
+    }
 }
 
 pub struct MutatorPool {
@@ -387,30 +440,49 @@ impl MutatorPool {
         Rc::new(MutatorPool { mutators: RefCell::new(Vec::new()) })
     }
 
-    pub fn on_event(&self, idx: usize, asset_value: Decimal) -> Decimal {
-        unsafe {
-            self.mutators.borrow().get_unchecked(idx).on_event(asset_value)
-        }
+    /// Returns `None` if mutator is not found at `idx`.
+    pub fn on_event(&self, idx: usize, asset_value: Decimal) -> Option<Decimal> {
+        if let Some(out) = self.mutators.borrow().get(idx) {
+            Some(out.on_event(asset_value))
+        } else { None }
+    }
+
+    pub unsafe fn on_event_unchecked(&self, idx: usize, asset_value: Decimal) -> Decimal {
+        self.mutators
+            .borrow()
+            .get_unchecked(idx)
+            .on_event(asset_value)
     }
 }
 
 pub struct Event {
     time_pos: u64,
-    pool: Rc<MutatorPool>,
-    mutator_idx: usize
+    mutator_idx: usize,
+    asset_idx: usize
 }
 
 impl Event {
-    pub fn trigger(&self, asset_pool: Rc<AssetPool>, asset_idx: usize) {
-        let value = unsafe {
-            asset_pool.get_unchecked(asset_idx) 
+    pub fn new(time_pos: u64, mutator_idx: usize, asset_idx: usize) -> Event {
+        Event { time_pos, mutator_idx, asset_idx }
+    }
+
+    pub fn trigger(&self, asset_pool: Rc<AssetPool>, mutator_pool: Rc<MutatorPool>) -> bool {
+        let value = match asset_pool.get(self.asset_idx) {
+            Some(value) => value,
+            None => { return false; },
         };
 
-        let change = self.pool.on_event(self.mutator_idx, value);
+        if let Some(new_value) = mutator_pool.on_event(self.mutator_idx, value) {
+            asset_pool.mutate(self.asset_idx, new_value)
+        } else { false }
+    }
 
-        if !asset_pool.mutate(asset_idx, change) {
-            panic!("Unable to mutate asset {}!", asset_idx);
-        }
+    pub unsafe fn trigger_unchecked(&self, asset_pool: Rc<AssetPool>, mutator_pool: Rc<MutatorPool>) {
+        asset_pool.mutate_unchecked(self.asset_idx, 
+            mutator_pool.on_event_unchecked(self.mutator_idx, 
+                asset_pool.get_unchecked(self.asset_idx)
+            )
+        );
     }
 }
 
@@ -450,5 +522,12 @@ pub struct IntervalPoint {
 pub struct Modeller {
     pub asset_pool: Rc<AssetPool>,
     pub mutator_pool: Rc<MutatorPool>,
-    pub account_pool: Rc<AccountPool>
+    pub account_pool: Rc<AccountPool>,
+    pub events: Vec<Event>
+}
+
+impl Modeller {
+    pub fn new(asset_pool: Rc<AssetPool>, mutator_pool: Rc<MutatorPool>, account_pool: Rc<AccountPool>) -> Modeller {
+        Modeller { asset_pool, mutator_pool, account_pool, events: Vec::new() }
+    }
 }
