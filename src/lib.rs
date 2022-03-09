@@ -1,12 +1,14 @@
-use std::{cell::{Cell, RefCell}, rc::Rc, borrow::{Borrow, BorrowMut}, slice::SliceIndex};
+use std::{cell::{Cell, RefCell}, rc::Rc};
 
 use rust_decimal::Decimal;
 
 #[cfg(test)]
 mod tests {
+    use std::rc::Rc;
+
     use rust_decimal::Decimal;
 
-    use crate::{AssetPool, Asset, MutatorPool, AccountPool, MutatorBase};
+    use crate::{AssetPool, Asset, MutatorPool, MutatorBase, StandardMutator, Modeller};
 
     #[test]
     fn asset_pool_changes() {
@@ -48,38 +50,56 @@ mod tests {
         
     }
 
-    // struct MockModel {
-    //     assets: Vec<Decimal>,
-    //     partial_mutators: Vec<(Decimal, u64, u64)>,
-    // }
+    struct MockModel {
+        assets: Vec<Decimal>,
+        partial_mutators: Vec<(Decimal, u64, u64)>,
+    }
 
-    // impl MockModel {
+    impl MockModel {
+        pub fn init() -> MockModel {
+            MockModel {
+                assets: vec![
+                    Decimal::ZERO,
+                    Decimal::new(1000, 0),
+                    Decimal::new(-50000, 0)
+                ],
+                partial_mutators: vec![
+                    (Decimal::new(100, 0), 3, 48),
+                    (Decimal::new(5, 4), 4, 53),
+                    (Decimal::new(50000, 0), 10, 41)
+                ]
+            }
+        }
+    }
 
-    //     /// Assets: 0, 1,000, 50,000, -8,000
-    //     /// Mutators: (0, 100, 3, )
-    //     pub fn init() -> MockModel {
-    //         MockModel {
-    //             assets: vec![
-    //                 Decimal::ZERO,
-    //                 Decimal::new(1000, 0),
-    //                 Decimal::new(50000, 0)
-    //             ],
-    //             partial_mutators: vec![
-    //                 (Decimal::new(100, 0), 3, 48),
-    //                 (Decimal::new(2, ))
-    //             ]
-    //         }
-    //     }
-    // }
+    #[test]
+    fn projection() {
+        // Assets: 0, 1,000, -50,000
+        // Mutators: (100, 3, 48), (0.0005, 4, 53), (50,000, 10, 41)
+        // Start 50 End 69 (19 Days)
 
-    // #[test]
-    // fn projection() {
-    //     let asset_pool = AssetPool::new();
-    //     let mutator_pool = MutatorPool::new();
-    //     let account_pool = AccountPool::new();
-
+        let asset_pool = AssetPool::new();
+        let mutator_pool = MutatorPool::new();
         
-    // }
+        let mock_model = MockModel::init();
+
+        for i in 0..3 {
+            let (change, cycle, urd) = mock_model.partial_mutators[i];
+            let ai = asset_pool.load(Asset::new(mock_model.assets[0]));
+            mutator_pool.load(
+                Box::new(StandardMutator(MutatorBase::new(
+                    i, ai, change, Decimal::ZERO, cycle, urd
+                )))
+            );
+        } // In reality you'd probably map ids to your data
+        
+        let results = Modeller::new(
+            Rc::clone(&asset_pool), 
+            Rc::clone(&mutator_pool)
+        ).project(50, 19, 1, 0, None);
+
+        // Make some assertions with results and expected asset values.
+    }
 }
 
 #[derive(PartialEq, Eq)]
@@ -97,101 +117,6 @@ impl Ord for AssetCapture {
 impl PartialOrd for AssetCapture {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))
-    }
-}
-
-pub struct AccountValueCapture {
-    total_value: Decimal,
-    idx: usize
-}
-
-pub struct AccountCapture {
-    asset_ids: Vec<usize>,
-    idx: usize
-}
-
-pub struct Account {
-    asset_ids: Vec<usize>
-}
-
-impl Account {
-    pub fn new() -> Account {
-        Account { asset_ids: vec![] }
-    }
-
-    pub fn get_asset_ids(&self) -> Vec<usize> {
-        self.asset_ids.clone()
-    }
-
-    pub fn add_asset(&mut self, asset_idx: usize) -> usize {
-        self.asset_ids.push(asset_idx);
-
-        self.asset_ids.len() - 1
-    }
-
-    pub fn total_value(&self, asset_pool: Rc<AssetPool>) -> Decimal {
-        self.asset_ids
-            .iter()
-            .fold(Decimal::ZERO, |accum, next_id| {
-                accum + asset_pool
-                    .get(*next_id)
-                    .unwrap_or(Decimal::ZERO)
-            })
-    }
-}
-
-pub struct AccountPool {
-    accounts: RefCell<Vec<Account>>
-}
-
-impl AccountPool {
-    pub fn new() -> Rc<AccountPool> {
-        Rc::new(AccountPool { accounts: RefCell::new(vec![]) })
-    }
-
-    pub fn load_account(&self) -> usize {
-        let mut accounts = self.accounts.borrow_mut();
-        accounts.push(Account::new());
-        accounts.len() - 1
-    }
-
-    pub fn load_into_account(&self, asset_idx: usize, account_idx: usize) -> Option<usize> {
-        if let Some(acc) = self.accounts.borrow_mut().get_mut(account_idx) {
-            Some(acc.add_asset(asset_idx))
-        } else { None }
-    }
-
-    pub unsafe fn load_into_account_unchecked(&self, asset_idx: usize, account_idx: usize) -> usize {
-        self.accounts
-            .borrow_mut()
-            .get_unchecked_mut(account_idx)
-            .add_asset(asset_idx)
-    }
-
-    /// Get total value of the account at idx.
-    /// 
-    /// Returns None if no element is found at idx.
-    pub fn get(&self, idx: usize, asset_pool: Rc<AssetPool>) -> Option<Decimal> {
-        if let Some(account) = self.accounts.borrow().get(idx) {
-            Some(account.total_value(Rc::clone(&asset_pool)))
-        } else { None }
-    }
-
-    /// Get total value of the account at idx.
-    /// 
-    /// No out of bounds checking, which may result in undefined behavior if no element is found at idx.
-    pub unsafe fn get_unchecked(&self, idx: usize, asset_pool: Rc<AssetPool>) -> Decimal {
-        self.accounts
-            .borrow()
-            .get_unchecked(idx)
-            .total_value(Rc::clone(&asset_pool))
-    }
-
-    /// Removes and returns the accounts from the given `AccountPool`.
-    /// 
-    /// The accounts are replaced with an empty vector.`
-    pub fn unload(&self) -> Vec<Account> {
-        self.accounts.replace(Vec::new())
     }
 }
 
@@ -307,6 +232,32 @@ impl AssetPool {
         captures.into_iter().for_each(|cap| {
             out.load(Asset::new(cap.value));
         });
+
+        out
+    }
+
+    pub fn value_of_group(&self, idxs: Vec<usize>) -> Option<Decimal> {
+        let assets = self.assets.borrow();
+        let mut accum = Decimal::ZERO;
+        
+        for i in 0..idxs.len() {
+            accum += assets[idxs[i]].get();
+
+            if let Some(asset) = assets.get(idxs[i]) {
+                accum += asset.get();
+            } else { return None }
+        }
+
+        Some(accum)
+    }
+
+    pub unsafe fn value_of_group_unchecked(&self, idxs: Vec<usize>) -> Decimal {
+        let assets = self.assets.borrow();
+        let mut out = Decimal::ZERO;
+        
+        for i in 0..idxs.len() {
+           out += assets.get_unchecked(idxs[i]).get(); 
+        }
 
         out
     }
@@ -453,6 +404,12 @@ impl MutatorPool {
             .get_unchecked(idx)
             .on_event(asset_value)
     }
+
+    pub fn load(&self, mutator: Box<dyn Mutator>) -> usize {
+        let mut mutators = self.mutators.borrow_mut();
+        mutators.push(mutator);
+        mutators.len() - 1
+    }
 }
 
 pub struct Event {
@@ -508,26 +465,34 @@ impl PartialEq for Event {
 
 pub struct EventMemento {
     time_pos: u64,
-    account_states: Vec<AccountCapture>,
     mutator_states: Vec<MutatorCapture>,
     asset_captures: Vec<AssetCapture>
 }
 
 pub struct IntervalPoint {
-    account_value_captures: Vec<AccountValueCapture>,
     mutator_captures: Vec<MutatorCapture>, // Might only need MutatorBaseCapture
     asset_captures: Vec<AssetCapture>
+}
+
+pub struct ResultPacket {
+    interval_points: Vec<IntervalPoint>,
+    event_mementos: Vec<EventMemento>
 }
 
 pub struct Modeller {
     pub asset_pool: Rc<AssetPool>,
     pub mutator_pool: Rc<MutatorPool>,
-    pub account_pool: Rc<AccountPool>,
     pub events: Vec<Event>
 }
 
 impl Modeller {
-    pub fn new(asset_pool: Rc<AssetPool>, mutator_pool: Rc<MutatorPool>, account_pool: Rc<AccountPool>) -> Modeller {
-        Modeller { asset_pool, mutator_pool, account_pool, events: Vec::new() }
+    pub fn new(asset_pool: Rc<AssetPool>, mutator_pool: Rc<MutatorPool>) -> Modeller {
+        Modeller { asset_pool, mutator_pool, events: Vec::new() }
+    }
+    
+    pub fn project(&self, start: u64, interval_len: u64, interval_count: u64, 
+        interval_delay: u64, memento: Option<EventMemento>) -> ResultPacket 
+    {
+        todo!()
     }
 }
